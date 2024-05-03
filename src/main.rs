@@ -8,6 +8,7 @@ use deno_core::Extension;
 use deno_core::ModuleLoadResponse;
 use deno_core::OpDecl;
 use deno_core::PollEventLoopOptions;
+use once_cell::sync::Lazy;
 use reqwest;
 use std::env;
 use std::rc::Rc;
@@ -121,6 +122,34 @@ impl deno_core::ModuleLoader for TsModuleLoader {
     }
 }
 
+pub static COMPILER_SNAPSHOT: Lazy<Box<[u8]>> = Lazy::new(
+    #[cold]
+    #[inline(never)]
+    || {
+        static COMPRESSED_COMPILER_SNAPSHOT: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/RUNJS_SNAPSHOT.bin"));
+
+        // NOTE(bartlomieju): Compressing the TSC snapshot in debug build took
+        // ~45s on M1 MacBook Pro; without compression it took ~1s.
+        // Thus we're not using compressed snapshot, trading off
+        // a lot of build time for some startup time in debug build.
+        #[cfg(debug_assertions)]
+        return COMPRESSED_COMPILER_SNAPSHOT.to_vec().into_boxed_slice();
+
+        #[cfg(not(debug_assertions))]
+        zstd::bulk::decompress(
+            &COMPRESSED_COMPILER_SNAPSHOT[4..],
+            u32::from_le_bytes(COMPRESSED_COMPILER_SNAPSHOT[0..4].try_into().unwrap()) as usize,
+        )
+        .unwrap()
+        .into_boxed_slice()
+    },
+);
+
+pub fn compiler_snapshot() -> &'static [u8] {
+    &COMPILER_SNAPSHOT
+}
+
 async fn run_js(file_path: &str) -> Result<(), AnyError> {
     let current_dir = env::current_dir()?;
     let main_module = deno_core::resolve_path(file_path, &current_dir)?;
@@ -145,6 +174,7 @@ async fn run_js(file_path: &str) -> Result<(), AnyError> {
             source_maps: source_map_store.clone(),
         })),
         extensions: vec![runjs_extension],
+        startup_snapshot: Some(compiler_snapshot()),
         ..Default::default()
     });
     js_runtime
